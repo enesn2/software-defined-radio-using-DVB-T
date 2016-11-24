@@ -4,17 +4,8 @@ import scipy.signal as signal
 import pyaudio
 import struct
 import time
+import math
 import asyncio
-
-elapsed_decimate1 = 0
-elapsed_convert = 0
-elapsed_read = 0
-elapsed_down1 = 0
-elapsed_shift = 0
-elapsed_demodulate = 0
-elapsed_deemphasis2 = 0
-elapsed_string = 0
-
 
 class Radio:
 	def __init__(self, station = int(100.3e6) ):
@@ -43,15 +34,23 @@ class Radio:
 		self.dec_audio = int(self.Fs_y/self.audio_freq)  
 		self.Fs_audio = int(self.Fs_y / self.dec_audio)
 
-		# To mix the data down, generate a digital complex exponential 
-		# (with the same length as x1) with phase -F_offset/Fs
-		self.fc1 = np.exp(-1.0j*2.0*np.pi* self.f_offset/self.Fs*np.arange((self.blocksize)))
 
 		# Configure software defined radio
 		self.sdr = RtlSdrAio()
 		self.sdr.sample_rate = self.Fs      # Hz  
 		self.sdr.center_freq = self.fc      # Hz  
 		self.sdr.gain = 'auto'  
+
+		# Downsample filter
+		self.downsample_coefficents = self.downsample_filter()
+
+		# Deemphasis filter
+		self.deemphasis_coefficents = self.deemphasis_filter()
+
+		# Block angle difference
+		self.block_angle = 0
+		self.block_angle_increment =  (float(self.blocksize*self.f_offset)/self.Fs \
+			- np.floor(self.blocksize*self.f_offset/self.Fs)) * 2.0 * np.pi
 
 		# Open audio stream
 		self.samp_width = 2
@@ -68,61 +67,51 @@ class Radio:
 		d = self.Fs_y * 75e-6   # Calculate the # of samples to hit the -3dB point  
 		x = np.exp(-1/d)   # Calculate the decay between each sample  
 		b = [1-x]          # Create the filter coefficients  
-		a = [1,-x] 
-		return (b, a)
+		a = [1,-x]
+		zi = signal.lfilter_zi(b, a)
+		return [b, a, zi]
 
 	def downsample_filter(self):
-		# Use Remez algorithm to design filter coefficients used for downscaling in frequency.
+		# Use Remez algorithm to design filter coefficients used for downsampling in frequency.
 		b = signal.remez(self.n_taps, [0, self.f_bw, self.f_bw+(self.Fs/2-self.f_bw)/4, self.Fs/2], [1,0], Hz=self.Fs) 				
-		return b
+		a = [1.0]
+		zi = signal.lfilter_zi(b, a)
+		return [b, a, zi]
            
 	def get_radio_samples(self):
 		assert type(self.sdr) is RtlSdr
-		global elapsed_read
-		t = time.time()
 		samples = self.sdr.read_samples(self.blocksize)
-		elapsed_read = time.time() - t
 		return samples
 
-	async def process_to_audio(self, samples):
+	async def process_to_audio(self, samples, downsample_coefficents, deemphasis_coefficents, block_angle):
 		global elapsed_decimate1, elapsed_convert, elapsed_down1, elapsed_shift, elapsed_demodulate, elapsed_deemphasis2, elapsed_string
 		# Convert samples to a numpy array
-		t = time.time()
 		x1 = np.array(samples).astype("complex64")
-		elapsed_convert = time.time() - t
 
 		# Now, just multiply x1 and the digital complex exponential
-		t = time.time()
-		x2 = x1 * self.fc1  	
-		elapsed_shift = time.time() - t
+		fc1 = np.exp((-1.0j*(2.0*np.pi* self.f_offset/self.Fs)*\
+			np.arange(self.blocksize)) + 1.0j*block_angle)
+		x2 = x1 * fc1  	
+		block_angle += self.block_angle_increment
+
 
 		# Downsample the signal
-		t = time.time()
-		b = self.downsample_filter()
-		x3 = signal.lfilter(b, 1.0, x2)
-		elapsed_down1 = time.time() - t
+		(b, a, zi_downsample) = downsample_coefficents
+		x3, zi_downsample = signal.lfilter(b, a, x2, zi = zi_downsample)
 
 		# Decimate the signal
-		t = time.time()
 		x4 = x3[0::self.dec_rate] 
-		elapsed_decimate1 = time.time() - t
 
 		# Polar discriminator
-		t = time.time()
 		y5 = x4[1:] * np.conj(x4[:-1])  
 		x5 = np.angle(y5)  
-		elapsed_demodulate = time.time() - t
 
 		# The deemphasis filter
-		t = time.time()
-		b, a = self.deemphasis_filter()
-		x6 = signal.lfilter(b,a,x5)  
-		elapsed_deemphasis2 = time.time() - t
+		(b, a, zi_deemphasis) = deemphasis_coefficents
+		x6, zi_deemphasis = signal.lfilter(b, a, x5, zi = zi_deemphasis)  
 
 		# Decimate to audio
-		t = time.time()
-		x7 = signal.decimate(x6, self.dec_audio)  
-		elapsed_decimate2 = time.time() - t
+		x7 = signal.decimate(x6, self.dec_audio, ftype = 'fir', zero_phase = True)  
 
 		# Scale audio to adjust volume
 		x7 *= int(10000 / np.max(np.abs(x7))) 
@@ -130,15 +119,12 @@ class Radio:
 		# Clip to avoid overflow
 		x7 = self.clip(self.samp_width, x7)
 
-		# Convert values to binary string
-		t = time.time()
-		assert self.samp_width == 2 # Otherwise 'h' is not applicable
-		output_string = struct.pack('h' * len(x7), *x7)
-		elapsed_string = time.time() - t
-		return output_string
+		return (x7, zi_downsample, zi_deemphasis, block_angle)
 
-	async def play_to_speaker(self, output_string):
-		# Send to the buffer of pyaudio object
+	async def play_to_speaker(self, audio_samples):
+		# Send bytes to the buffer of the pyaudio object
+		assert self.samp_width == 2 # Otherwise 'h' is not applicable
+		output_string = struct.pack('h' * len(audio_samples), *audio_samples)
 		self.stream.write(output_string)
 		return
 
@@ -173,10 +159,12 @@ class Radio:
 		# the output string to the output speaker
 		blocks_so_far = 0
 		async for samples in self.sdr.stream(num_samples_or_bytes = self.blocksize, format = 'samples'):
-			# Process to audio
-			output_string = await self.process_to_audio(samples)
+			# Process to audio and update the residues
+			audio_samples, self.downsample_coefficents[2], self.deemphasis_coefficents[2], self.block_angle = \
+				await self.process_to_audio(samples, self.downsample_coefficents,
+				 self.deemphasis_coefficents, self.block_angle)
 			# Play to speaker
-			await self.play_to_speaker(output_string)
+			await self.play_to_speaker(audio_samples)
 			# Done with this block
 			blocks_so_far += 1
 			# We have streamed all of the block
@@ -198,18 +186,3 @@ class Radio:
 radio = Radio()
 radio.play()
 radio.close()
-
-
-
-
-
-
-
-print("Read time:", str(elapsed_read))
-print("Convert to array time:", str(elapsed_convert))
-print("Shift frequency time:", str(elapsed_shift))
-print("Downscale one time:", str(elapsed_down1))
-print("Decimate one time:", str(elapsed_decimate1 ))
-print("Demodulate time:", str(elapsed_demodulate))
-print("Deemphasis filter time:", str(elapsed_deemphasis2))
-print("Convert to string time:", str(elapsed_string))
