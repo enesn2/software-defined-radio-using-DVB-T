@@ -19,7 +19,8 @@ ldconfig
 
 cd
 
-pip install pyrtlsdr   
+pip install pyrtlsdr  
+pip install pyaudio  
 
 wget https://raw.githubusercontent.com/keenerd/rtl-sdr-misc/master/heatmap/flatten.py
 
