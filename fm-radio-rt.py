@@ -1,9 +1,10 @@
-from rtlsdr import RtlSdr  
+from rtlsdr import RtlSdrAio  
 import numpy as np  
 import scipy.signal as signal
 import pyaudio
 import struct
 import time
+import asyncio
 
 elapsed_decimate1 = 0
 elapsed_convert = 0
@@ -12,6 +13,7 @@ elapsed_down1 = 0
 elapsed_shift = 0
 elapsed_demodulate = 0
 elapsed_deemphasis2 = 0
+elapsed_string = 0
 
 
 class Radio:
@@ -22,8 +24,9 @@ class Radio:
 		self.fc = self.f_station - self.f_offset 	# Capture center frequency  
 
 		# Sampling parameters
-		self.Fs = int(1140000)		     				# Sample rate (different from the audio sample rate)
-		self.blocksize = int(8192000) 				# Samples to capture per block
+		self.Fs = int(1140000)     			# Sample rate (different from the audio sample rate)
+		self.blocksize = int(16384) 		# Samples to capture per block
+		self.n_blocks = 10000
 
 		# An FM broadcast signal has  a bandwidth of 200 kHz
 		self.f_bw = 200000  
@@ -35,8 +38,8 @@ class Radio:
 		self.Fs_y = self.Fs/self.dec_rate  
 
 		# Find a decimation rate to achieve audio sampling rate between 44-48 kHz. This
-		# is used in the second decimation
-		self.audio_freq = 44100.0  
+		# is used in the second decimation.
+		self.audio_freq = 48000.0  
 		self.dec_audio = int(self.Fs_y/self.audio_freq)  
 		self.Fs_audio = int(self.Fs_y / self.dec_audio)
 
@@ -45,7 +48,7 @@ class Radio:
 		self.fc1 = np.exp(-1.0j*2.0*np.pi* self.f_offset/self.Fs*np.arange((self.blocksize)))
 
 		# Configure software defined radio
-		self.sdr = RtlSdr()
+		self.sdr = RtlSdrAio()
 		self.sdr.sample_rate = self.Fs      # Hz  
 		self.sdr.center_freq = self.fc      # Hz  
 		self.sdr.gain = 'auto'  
@@ -74,13 +77,15 @@ class Radio:
 		return b
            
 	def get_radio_samples(self):
+		assert type(self.sdr) is RtlSdr
 		global elapsed_read
 		t = time.time()
-		return self.sdr.read_samples(self.blocksize)
+		samples = self.sdr.read_samples(self.blocksize)
 		elapsed_read = time.time() - t
+		return samples
 
-	def process_to_audio(self, samples):
-		global elapsed_decimate1, elapsed_convert, elapsed_down1, elapsed_shift, elapsed_demodulate, elapsed_deemphasis2
+	async def process_to_audio(self, samples):
+		global elapsed_decimate1, elapsed_convert, elapsed_down1, elapsed_shift, elapsed_demodulate, elapsed_deemphasis2, elapsed_string
 		# Convert samples to a numpy array
 		t = time.time()
 		x1 = np.array(samples).astype("complex64")
@@ -125,8 +130,6 @@ class Radio:
 		# Clip to avoid overflow
 		x7 = self.clip(self.samp_width, x7)
 
-		print("Type", type(x7))
-
 		# Convert values to binary string
 		t = time.time()
 		assert self.samp_width == 2 # Otherwise 'h' is not applicable
@@ -134,10 +137,13 @@ class Radio:
 		elapsed_string = time.time() - t
 		return output_string
 
-	def play_to_speaker(self, output_string):
+	async def play_to_speaker(self, output_string):
+		# Send to the buffer of pyaudio object
 		self.stream.write(output_string)
+		return
 
 	def clip(self, width, array):
+		# Use to prevent overflow when converting to bytes
 		python_array = []		# The expected input is a numpy array
 		for i in range(len(array)):
 			if array[i] > (2**(8*width-1)-1):
@@ -148,10 +154,35 @@ class Radio:
 				python_array.append(int(array[i]))
 		return python_array
 
-	def play(self):
+	def play_a_block(self):
+		# If in synchronous mode, use the method to play one sample block.
+		assert type(self.sdr) is RtlSdr
 		samples = self.get_radio_samples()
 		output_string = self.process_to_audio(samples)
 		self.play_to_speaker(output_string)
+
+	def play(self):
+		# Play blocks in a stream using the asynchronous mode
+		assert type(self.sdr) is  RtlSdrAio
+		loop = asyncio.get_event_loop()
+		loop.run_until_complete(self.stream_samples())
+
+	async def stream_samples(self):
+		assert type(self.sdr) is RtlSdrAio
+		# Stream and process the required number of blocks to audio, then send the 
+		# the output string to the output speaker
+		blocks_so_far = 0
+		async for samples in self.sdr.stream(num_samples_or_bytes = self.blocksize, format = 'samples'):
+			# Process to audio
+			output_string = await self.process_to_audio(samples)
+			# Play to speaker
+			await self.play_to_speaker(output_string)
+			# Done with this block
+			blocks_so_far += 1
+			# We have streamed all of the block
+			if blocks_so_far >= self.n_blocks:
+				break	
+		await self.sdr.stop()
 
 	def close(self):
 		# Clean up the SDR device
