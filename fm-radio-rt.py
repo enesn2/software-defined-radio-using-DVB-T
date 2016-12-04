@@ -6,6 +6,12 @@ import struct
 import time
 import math
 import asyncio
+import cProfile, pstats, io
+import struct
+
+
+pr = cProfile.Profile()
+#pr.enable()
 
 class Radio:
 	def __init__(self, station = int(100.3e6) ):
@@ -16,7 +22,7 @@ class Radio:
 
 		# Sampling parameters
 		self.Fs = int(1140000)     			# Sample rate (different from the audio sample rate)
-		self.blocksize = int(16384) 		# Samples to capture per block
+		self.blocksize = int(128*1024) 		# Samples to capture per block
 		self.n_blocks = 10000
 
 		# An FM broadcast signal has  a bandwidth of 200 kHz
@@ -60,7 +66,8 @@ class Radio:
 		                 channels = self.channels,
 		                 rate = self.Fs_audio,
 		                 input = False,
-		                 output = True)
+		                 output = True,
+		                 frames_per_buffer = 7000)
 
 	def deemphasis_filter(self):
 		# The de-emphasis filter
@@ -86,8 +93,8 @@ class Radio:
 	async def process_to_audio(self, samples, downsample_coefficents, deemphasis_coefficents, block_angle):
 		global elapsed_decimate1, elapsed_convert, elapsed_down1, elapsed_shift, elapsed_demodulate, elapsed_deemphasis2, elapsed_string
 		# Convert samples to a numpy array
-		x1 = np.array(samples).astype("complex64")
-
+		#x1 = np.array(samples).astype("complex64")
+		x1 = samples
 		# Now, just multiply x1 and the digital complex exponential
 		fc1 = np.exp((-1.0j*(2.0*np.pi* self.f_offset/self.Fs)*\
 			np.arange(self.blocksize)) + 1.0j*block_angle)
@@ -97,10 +104,11 @@ class Radio:
 
 		# Downsample the signal
 		(b, a, zi_downsample) = downsample_coefficents
-		x3, zi_downsample = signal.lfilter(b, a, x2, zi = zi_downsample)
+		#x3, zi_downsample = signal.lfilter(b, a, x2, zi = zi_downsample)
 
 		# Decimate the signal
-		x4 = x3[0::self.dec_rate] 
+		#x4 = x3[0::self.dec_rate] 
+		x4 = signal.decimate(x2, self.dec_rate, ftype = 'fir', zero_phase = True)  
 
 		# Polar discriminator
 		y5 = x4[1:] * np.conj(x4[:-1])  
@@ -186,3 +194,10 @@ class Radio:
 radio = Radio()
 radio.play()
 radio.close()
+
+pr.disable()
+s = io.StringIO()
+sortby = 'cumulative'
+ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+ps.print_stats()
+print(s.getvalue())
