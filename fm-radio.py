@@ -2,6 +2,7 @@ from rtlsdr import RtlSdr
 import numpy as np  
 import scipy.signal as signal
 import pyaudio
+import time
 
 
 # The radio station frequency
@@ -10,9 +11,9 @@ F_offset = 250000			# Offset to capture at
 Fc = F_station - F_offset 	# Capture center frequency  
 
 # Sample properties
-Fs = int(1140000)		# Sample rate (different from the audio sample rate)
+Fs = int(1200000)		# Sample rate (different from the audio sample rate)
 T = int(8)				# Seconds to capture
-N = int(8192000)  		# Samples to capture 
+N = int(1024*1024)  		# Samples to capture 
 
 # Configure software defined radio
 sdr = RtlSdr()
@@ -28,10 +29,12 @@ n_taps = 64
 lpf = signal.remez(n_taps, [0, f_bw, f_bw+(Fs/2-f_bw)/4, Fs/2], [1,0], Hz=Fs) 
 
 # Read samples
-samples = sdr.read_samples(N)
+before = time.time()
+samples = sdr.read_bytes(2*N)
+print time.time()-before
 
 # Convert samples to a numpy array
-x1 = np.array(samples).astype("complex64")
+x1 = sdr.packed_bytes_to_iq(samples)
 
 # To mix the data down, generate a digital complex exponential 
 # (with the same length as x1) with phase -F_offset/Fs
@@ -72,6 +75,8 @@ x7 = signal.decimate(x6, dec_audio)
 
 # Scale audio to adjust volume
 x7 *= 10000 / np.max(np.abs(x7)) 
+
+print float(len(x7))/44100
 
 # Save to file as 16-bit signed single-channel audio samples
 x7.astype("int16").tofile("wbfm-mono.raw") 
