@@ -7,6 +7,7 @@ import struct
 import time
 import asyncio
 import cProfile, pstats, io
+import threading
 from threading import Thread, Lock, Condition
 from queue import Queue
 
@@ -17,6 +18,7 @@ pr = cProfile.Profile()
 queue =  Queue(10)
 audio_queue = Queue(10)
 condition = Condition()
+blocks = 0
 lock = Lock()
 
 # These store the delays for various filters in radio processing
@@ -66,19 +68,19 @@ class AudioSamplesProcessor(Thread):
 		             rate = audioFs,
 		             input = False,
 		             output = True,
-		             frames_per_buffer = 10500)	
+		             frames_per_buffer = 10500*2)	
 	def run(self):
 		global audio_queue
 		while True:
 			#print('Reading samples:')
 			audio_samples = audio_queue.get()
-			
+			audio_queue.task_done()
 			output_string = struct.pack('h' * len(audio_samples), *audio_samples)
 
 			#print('Playing samples length:', len(audio_samples))
 
 			self.stream.write(output_string)
-			audio_queue.task_done()
+			
 			#print('Task done')
 		
 
@@ -109,7 +111,7 @@ class RadioSamplesProcessor(Thread):
 		# Find a decimation rate to achieve audio sampling rate for audio between 44-48 kHz. This
 		# is used in the second decimation.
 		self.audio_freq = audioFs 
-		self.dec_audio = int(self.Fs_y/self.audio_freq)  
+		self.dec_audio = int(self.Fs_y / self.audio_freq)  
 		self.Fs_audio = int(self.Fs_y / self.dec_audio)
 
 		# Block angle difference
@@ -153,7 +155,7 @@ class RadioSamplesProcessor(Thread):
 		block_angle += self.block_angle_increment
 
 		# Decimate the signal to focus on the radio frequencies of interest
-		x3 = signal.decimate(x2, self.dec_rate, ftype = 'fir', zero_phase = True)  
+		x3 = signal.decimate(x2, self.dec_rate, n = 32, ftype = 'fir', zero_phase = True)  
 
 		# Demodulate the IQ samples
 		y4 = x3[1:] * np.conj(x3[:-1])  
@@ -179,11 +181,11 @@ class RadioSamplesProcessor(Thread):
 	def run(self):
 		''' This method is called by Thread().start()
 		'''
-		global queue, block_angle, delays
+		global queue, block_angle, delays, blocks
 		global audio_queue
 		while True:
 			samples = queue.get()
-			
+			queue.task_done()
 			
 			deemphasis_delay = delays[0]
 			now = time.time()
@@ -191,10 +193,14 @@ class RadioSamplesProcessor(Thread):
 				samples, deemphasis_delay, block_angle)
 			delays[0] = deemphasis_delay
 			block_angle = block_angle_current
+			lock.acquire()
 			audio_queue.put(audio_samples)
+			#print('')
+			lock.release()
 			#print('Placed audio samples' )		
-
-			queue.task_done()
+			blocks += 1
+			#print('Thread',  threading.current_thread(), 'processed block', blocks)
+			
 			#print('It took',time.time()-now,'seconds to process the audio samples.')
 			#print('Samples are', float(len(audio_samples))/48000.00,'secondslong.')
 			#print(len(audio_samples))
@@ -217,7 +223,7 @@ class Radio:
 		# Sampling parameters for the rtl-sdr
 		self.Fs = 1140000     			    # Sample rate (different from the audio sample rate)
 		self.blocksize = 128*2*1024 		    # Samples to capture per bloc
-		self.audioFs = 40000
+		self.audioFs = 48000
 
 		# Configure software defined radio thread/class
 		self.sdr1 = SDR(self.fc, self.Fs, self.blocksize, self.sample_width) 
