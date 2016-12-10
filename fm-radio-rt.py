@@ -16,24 +16,28 @@ pr = cProfile.Profile()
 
 # This queue stores unprocessed blocks of radio samples
 queue =  Queue(10)
+
+# This queue stores audio samples
 audio_queue = Queue(10)
+
+# These threading modules are used to manage concurrency
 condition = Condition()
-blocks = 0
 lock = Lock()
 
-# These store the delays for various filters in radio processing
+# These store delays for various filters in radio processing
 delays = []
 block_angle = 0
+
 #pr.enable()
 
-class SDR(Thread):
+class SDR:
 	'''
 	This is a producer class that samples radio signal blocks and places them
 	in a global queue
 	'''
 
 	def __init__(self, startFc, Fs, blocksize, sample_width):
-		super(SDR, self).__init__()
+		#super(SDR, self).__init__()
 
 		self.blocksize = blocksize
 		self.sample_width = sample_width
@@ -44,13 +48,14 @@ class SDR(Thread):
 
 
 	def run(self):
-		loop = asyncio.new_event_loop()
+		loop = asyncio.get_event_loop()
 		asyncio.set_event_loop(loop) 
 		loop.run_until_complete(self.stream_samples())
 
 	async def stream_samples(self):
 		global queue
 		async for samples in self.sdr.stream(num_samples_or_bytes = 2*self.blocksize, format = 'bytes'):
+			#print('Gathered a block')
 			queue.put(samples)
 		self.sdr.stop()
 
@@ -68,7 +73,7 @@ class AudioSamplesProcessor(Thread):
 		             rate = audioFs,
 		             input = False,
 		             output = True,
-		             frames_per_buffer = 10500*2)	
+		             frames_per_buffer = 10500*3*2)	
 	def run(self):
 		global audio_queue
 		while True:
@@ -90,7 +95,7 @@ class RadioSamplesProcessor(Thread):
 	them to the PyAudio object to be played by the audio output device.
 	'''
 
-	def __init__(self, blocksize, Fs, sample_width, f_offset, audioFs):
+	def __init__(self, blocksize, Fs, sample_width, f_offset, audioFs, ID):
 		super(RadioSamplesProcessor, self).__init__()
 
 		# Radio sampling rate
@@ -99,6 +104,8 @@ class RadioSamplesProcessor(Thread):
 		self.sample_width = sample_width
 		self.blocksize = blocksize
 		self.f_offset = f_offset
+
+		self.ID = ID
 
 		# An FM broadcast signal has  a bandwidth of 200 kHz
 		self.f_bw = 200000 
@@ -140,7 +147,7 @@ class RadioSamplesProcessor(Thread):
 		Processes binary samples from the sdr into audio samples to be played by the
 		audio device.
 		'''
-
+		global delays
 		# Convert to a numpy array of complex IQ samples
 		iq = np.empty(len(samples)//2, 'complex')
 		iq.real, iq.imag = samples[::2], samples[1::2]
@@ -155,7 +162,7 @@ class RadioSamplesProcessor(Thread):
 		block_angle += self.block_angle_increment
 
 		# Decimate the signal to focus on the radio frequencies of interest
-		x3 = signal.decimate(x2, self.dec_rate, n = 32, ftype = 'fir', zero_phase = True)  
+		x3 = signal.decimate(x2, self.dec_rate, n = 22, ftype = 'fir', zero_phase = True)  
 
 		# Demodulate the IQ samples
 		y4 = x3[1:] * np.conj(x3[:-1])  
@@ -164,13 +171,14 @@ class RadioSamplesProcessor(Thread):
 		# The deemphasis filter
 		(b, a, zi) = self.deemphasis_coefficents
 		zi_deemphasis = deemphasis_delay
+		delays[0] = zi_deemphasis
 		x5, zi_deemphasis = signal.lfilter(b, a, x4, zi = zi_deemphasis)  
 
 		# Decimate to audio
-		x6 = signal.decimate(x5, self.dec_audio, ftype = 'fir', zero_phase = True)  
+		x6 = signal.decimate(x5, self.dec_audio, n = 22, ftype = 'fir', zero_phase = True)  
 
 		# Scale audio to adjust volume
-		x6 *= int(10000 / np.max(np.abs(x6))) 
+		x6 *= int(32000 / np.max(np.abs(x6))) 
 
 		# Clip to avoid overflow
 		x6 = np.clip(x6, (-2**(self.sample_width*8-1)), (2**(self.sample_width*8-1) - 1))
@@ -181,31 +189,33 @@ class RadioSamplesProcessor(Thread):
 	def run(self):
 		''' This method is called by Thread().start()
 		'''
-		global queue, block_angle, delays, blocks
+		global queue, block_angle, delays
 		global audio_queue
 		while True:
+			#print('Thread',  threading.current_thread(), 'working')
 			samples = queue.get()
 			queue.task_done()
 			
 			deemphasis_delay = delays[0]
+			delays[0] = self.deemphasis_coefficents[2]
 			now = time.time()
 			audio_samples, deemphasis_delay, block_angle_current = self.process_to_audio(
 				samples, deemphasis_delay, block_angle)
-			delays[0] = deemphasis_delay
-			block_angle = block_angle_current
-			lock.acquire()
+			#delays[0] = deemphasis_delay
+			#block_angle = block_angle_current
+			#lock.acquire()
+			
 			audio_queue.put(audio_samples)
 			#print('')
-			lock.release()
-			#print('Placed audio samples' )		
-			blocks += 1
-			#print('Thread',  threading.current_thread(), 'processed block', blocks)
+			#print('Thread',  threading.current_thread(), 'done')
+			#lock.release()
+			#print('Placed audio samples' )	
+			
 			
 			#print('It took',time.time()-now,'seconds to process the audio samples.')
 			#print('Samples are', float(len(audio_samples))/48000.00,'secondslong.')
 			#print(len(audio_samples))
-			
-		print('I dont know what an infinite loop is. ')   
+			  
 
 
 
@@ -222,16 +232,16 @@ class Radio:
 
 		# Sampling parameters for the rtl-sdr
 		self.Fs = 1140000     			    # Sample rate (different from the audio sample rate)
-		self.blocksize = 128*2*1024 		    # Samples to capture per bloc
-		self.audioFs = 48000
+		self.blocksize = 128*1024*2*2 		    # Samples to capture per bloc
+		self.audioFs = 45000
 
 		# Configure software defined radio thread/class
 		self.sdr1 = SDR(self.fc, self.Fs, self.blocksize, self.sample_width) 
 
 		# Configure radio samples processors thread/class
-		self.radio_processor1 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs)
-		self.radio_processor2 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs)
-		#self.radio_processor3 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs)
+		self.radio_processor1 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs, 1)
+		self.radio_processor2 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs, 2)
+		#self.radio_processor3 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs, 3)
 
 		# Define audio processor
 		self.audio_processor = AudioSamplesProcessor(self.sample_width, self.audioFs)
@@ -272,11 +282,12 @@ class Radio:
 		Start the `sdr` thread that samples the air and the `processor` thread that
 		processes the samples to audio.
 		'''
-		self.sdr1.start()
+		
 		self.radio_processor1.start()
 		self.radio_processor2.start()
 		#self.radio_processor3.start()
 		self.audio_processor.start()
+		self.sdr1.run()
 
 
 	def close(self):
