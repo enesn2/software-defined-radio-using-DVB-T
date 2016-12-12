@@ -10,24 +10,37 @@ import cProfile, pstats, io
 import threading
 from threading import Thread, Lock, Condition
 from queue import Queue
+import argparse
 
+parser = argparse.ArgumentParser(description='Software-defined radio with audio filters.')
+parser.add_argument('--time', type=int, default=15,
+                    help='Number of seconds to run.')
+parser.add_argument('--audio-filter', type=str, default='none',
+                    help='The audio filter to be applied on sound.')
+
+args = parser.parse_args()
+seconds = args.time
+audio_filter = args.audio_filter
 
 pr = cProfile.Profile()
 
-# This queue stores unprocessed blocks of radio samples
+# This global queue stores unprocessed blocks of radio samples
 queue =  Queue(10)
 
-# This queue stores audio samples
+# This global queue stores audio samples
 audio_queue = Queue(10)
 
-# This queue stores filtered audio samples
+# This global queue stores filtered audio samples
 filtered_audio_queue = Queue(10)
+
+# This global variable will contain the last block that was filtered
+last_filtered = []
 
 # These threading modules are used to manage concurrency
 condition = Condition()
 lock = Lock()
 
-# These store delays for various filters in radio processing
+# These global variables store delays for various filters in radio processing
 delays = []
 block_angle = 0
 
@@ -81,36 +94,75 @@ class AudioSamplesProcessor(Thread):
 		             input = False,
 		             output = True,
 		             frames_per_buffer = self.audio_buffer_length)	
-		self.previous_block = []
+
 
 	def run(self):
-		global audio_queue
+		global filtered_audio_queue
 		while True:
-			audio_samples = audio_queue.get()
-			audio_queue.task_done()
+			audio_samples = filtered_audio_queue.get()
+			filtered_audio_queue.task_done()
 
 			# Used to stop the thread
 			if audio_samples is None:
 				break
 
-			# Fill the previous block with zeros on the first run
-			if not(len(self.previous_block)):
-				self.previous_block = np.zeros((len(audio_samples),),)
-
-			audio_samples = self.audio_filter(audio_samples, self.previous_block, 'robo')
 			# Write to bytes
 			output_string = struct.pack('h' * len(audio_samples), *audio_samples)
 
 			# Write stream
 			self.stream.write(output_string)
-
-			# Keep the previous block
-			self.previous_block = audio_samples
 			
 			#print('Task done')
 		self.stream.stop_stream()
 
-	def audio_filter(self,audio_block, previous_block, type = 'nofilter'):
+	def close():
+		stream.close()
+		p.terminate()
+	
+class FilterSamplesProcessor(Thread):
+	''' This thread plays the audio samples from the audio queue
+	'''
+
+	def __init__(self, R, sample_width, ID, filter = 'none'):
+		super(FilterSamplesProcessor, self).__init__()
+		self.filter = filter
+		self.R = R
+		self.ID = ID
+		self.sample_width = sample_width
+		self.previous_block = []
+
+	def run(self):
+		global audio_queue, filtered_audio_queue, last_filtered
+		while True:
+			audio_samples = audio_queue.get()
+			audio_queue.task_done()
+
+			self.previous_block = last_filtered
+
+			# Update the last filtered sample overall
+			lock.acquire()
+			last_filtered = audio_samples
+			lock.release()
+
+			# Used to stop the thread
+			if audio_samples is None:
+				filtered_audio_queue.put(None)
+				break
+
+			# Fill the previous block with zeros on the first run
+			if not(self.previous_block is None) and not(len(self.previous_block)):
+				self.previous_block = np.zeros((len(audio_samples),),)
+
+			audio_samples = self.audio_filter(audio_samples, self.previous_block, self.filter)
+
+			filtered_audio_queue.put(audio_samples)
+
+			# Keep the previous block
+			self.previous_block = audio_samples
+			
+
+
+	def audio_filter(self,audio_block, previous_block, type = 'none'):
 		if type == 'robot':
 			audio_block = self.robot(audio_block, previous_block)
 		audio_block = np.clip(audio_block, (-2**(self.sample_width*8-1)), (2**(self.sample_width*8-1) - 1))
@@ -128,7 +180,8 @@ class AudioSamplesProcessor(Thread):
 		'''
 
 		# Convert the inputs into numpy arrays
-		overlapping_block = np.concatenate((previous_block[R/2:R], current_block[0:R/2]))
+		assert R%2==0
+		overlapping_block = np.concatenate((previous_block[int(R/2):R], current_block[0:int(R/2)]))
 
 		# Create the window
 		n = np.array(range(1,R+1))+0.5
@@ -169,7 +222,7 @@ class AudioSamplesProcessor(Thread):
 	def robot(self, current_audio_block, previous_block):
 
 		# Number of bins in sfft
-		Nfft = 512
+		Nfft = self.R
 		R = int(Nfft)
 
 		# We only need a sample of the previous block
@@ -206,10 +259,10 @@ class AudioSamplesProcessor(Thread):
 			first_block, second_block, third_block = self.istft(first_block_ft, second_block_ft, third_block_ft, R)
 
 			# Take the second half of the first block and pad the rest with zeros
-			first_block = np.concatenate((first_block[R/2:R], np.zeros((R/2),)),)
+			first_block = np.concatenate((first_block[int(R/2):R], np.zeros( (int(R/2),)   ),  ))
 
 			# Take the first half of the third block and pad the reset with zeros
-			third_block = np.concatenate((np.zeros((R/2),), third_block[0:R/2] ),)
+			third_block = np.concatenate((np.zeros((int(R/2),)), third_block[0:int(R/2)] ),)
 
 			# Obtain the output from the overlapping regions of the three blocks
 			robot = np.add(first_block, second_block)
@@ -229,10 +282,7 @@ class AudioSamplesProcessor(Thread):
 
 		return processed_block
 
-	def close():
-		stream.close()
-		p.terminate()
-	
+
 
 class RadioSamplesProcessor(Thread):
 	'''
@@ -325,8 +375,6 @@ class RadioSamplesProcessor(Thread):
 		# Scale audio to adjust volume
 		x6 *= int(32000 / np.max(np.abs(x6))) 
 
-		# Clip to avoid overflow
-
 
 		return (x6, zi_deemphasis, block_angle)
 
@@ -338,7 +386,7 @@ class RadioSamplesProcessor(Thread):
 		while True:
 			#print('Thread',  threading.current_thread(), 'working')
 			samples = queue.get()
-			queue.task_done()
+			#queue.task_done()
 			if samples is None:
 				audio_queue.put(None)
 				break
@@ -353,6 +401,7 @@ class RadioSamplesProcessor(Thread):
 			#lock.acquire()
 			
 			audio_queue.put(audio_samples)
+			queue.task_done()
 			#print('')
 			#print('Thread',  threading.current_thread(), 'done')
 			#lock.release()
@@ -382,21 +431,12 @@ class Radio:
 		# Sampling parameters for the rtl-sdr
 		self.Fs = 1140000     			    # Sample rate (different from the audio sample rate)
 		self.blocksize = 128*1024*2*2 		    # Samples to capture per bloc
-		self.audioFs = 40000
+		self.audioFs = 24000
 
 		# Configure software defined radio thread/class
 		self.sdr1 = SDR(self.fc, self.Fs, self.blocksize, self.sample_width) 
 
-		# Configure radio samples processors thread/class
-		self.radio_processor1 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs, 1)
-		self.radio_processor2 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs, 2)
-		#self.radio_processor3 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs, 3)
 
-		# Define audio processor
-		self.audio_processor = AudioSamplesProcessor(self.sample_width, self.audioFs, self.audio_buffer_length)
-
-		self.radio_threads = [self.radio_processor1, self.radio_processor2]
-           
 	def get_radio_samples(self):
 		''' For sampling of a single block in synchronous mode
 		'''
@@ -430,20 +470,39 @@ class Radio:
 
 	def stop(self):
 		# Stop all consumer threads
-		for i in range(self.radio_threads):
+		for i in range(len(self.radio_threads)):
 			queue.put(None)
 		for thread in self.all_threads:
 			thread.join()
 
-	def play(self):
+	def play(self, filter_type = 'none', seconds = 10):
 		''' 
 		Start the `sdr` thread that samples the air, the `radio_processor` thread that
 		processes the samples to audio and the `radio_processor` that plays samples.
 		'''
-		for thread in self.radio_threads:
-			thread.start()
+		self.n_blocks = int(seconds * self.Fs / self.blocksize)
 
-		self.audio_processor.start()
+
+		# Configure radio samples processors thread/class
+		self.n_radio_threads = 2
+		self.radio_threads = []
+		for i in range(self.n_radio_threads):
+			self.radio_threads.append( \
+				RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs, i))
+
+		# Define filter processors
+		self.n_filter_threads = 2
+		self.filter_threads = []
+		for i in range(self.n_filter_threads):
+			self.filter_threads.append(FilterSamplesProcessor(512, self.sample_width, i, filter_type))
+
+		# Define audio processor
+		self.audio_processor = AudioSamplesProcessor(self.sample_width, self.audioFs, self.audio_buffer_length)
+
+		self.all_threads = [self.audio_processor] + self.radio_threads + self.filter_threads
+
+		for thread in self.all_threads:
+			thread.start()
 
 		self.sdr1.run(self.n_blocks)
 		self.stop()
@@ -461,7 +520,7 @@ class Radio:
 
 
 radio = Radio()
-radio.play()
+radio.play(audio_filter, seconds)
 #radio.close()
 
 '''
