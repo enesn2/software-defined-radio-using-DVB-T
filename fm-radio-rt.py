@@ -46,40 +46,46 @@ class SDR:
 		self.sdr.center_freq = startFc     # Hz  
 		self.sdr.gain = 'auto'
 
-
-	def run(self):
+	def run(self, n_blocks):
 		loop = asyncio.get_event_loop()
 		asyncio.set_event_loop(loop) 
-		loop.run_until_complete(self.stream_samples())
+		loop.run_until_complete(self.stream_samples(n_blocks))
 
-	async def stream_samples(self):
+	async def stream_samples(self, n_blocks):
 		global queue
+		blocks_so_far = 0
 		async for samples in self.sdr.stream(num_samples_or_bytes = 2*self.blocksize, format = 'bytes'):
 			#print('Gathered a block')
 			queue.put(samples)
-		self.sdr.stop()
+			blocks_so_far+=1
+			if blocks_so_far>=n_blocks:
+				break
+		await self.sdr.stop()
 
 class AudioSamplesProcessor(Thread):
 	''' This thread plays the audio samples from the audio queue
 	'''
 
-	def __init__(self, sample_width, audioFs):
+	def __init__(self, sample_width, audioFs, audio_buffer_length):
 		super(AudioSamplesProcessor, self).__init__()
 
 		self.sample_width = sample_width
 		self.p = pyaudio.PyAudio()
+		self.audio_buffer_length = audio_buffer_length
 		self.stream = self.p.open(format = self.p.get_format_from_width(self.sample_width),
 		             channels = 1,
 		             rate = audioFs,
 		             input = False,
 		             output = True,
-		             frames_per_buffer = 10500*3*2)	
+		             frames_per_buffer = self.audio_buffer_length)	
 	def run(self):
 		global audio_queue
 		while True:
 			#print('Reading samples:')
 			audio_samples = audio_queue.get()
 			audio_queue.task_done()
+			if audio_samples is None:
+				break
 			output_string = struct.pack('h' * len(audio_samples), *audio_samples)
 
 			#print('Playing samples length:', len(audio_samples))
@@ -195,6 +201,8 @@ class RadioSamplesProcessor(Thread):
 			#print('Thread',  threading.current_thread(), 'working')
 			samples = queue.get()
 			queue.task_done()
+			if samples is None:
+				break
 			
 			deemphasis_delay = delays[0]
 			delays[0] = self.deemphasis_coefficents[2]
@@ -229,11 +237,13 @@ class Radio:
 		self.fc = self.f_station - self.f_offset 	# Capture center frequency  
 
 		self.sample_width = 2
+		self.audio_buffer_length = 10500*3*2
+		self.n_blocks = 20
 
 		# Sampling parameters for the rtl-sdr
 		self.Fs = 1140000     			    # Sample rate (different from the audio sample rate)
 		self.blocksize = 128*1024*2*2 		    # Samples to capture per bloc
-		self.audioFs = 45000
+		self.audioFs = 44000
 
 		# Configure software defined radio thread/class
 		self.sdr1 = SDR(self.fc, self.Fs, self.blocksize, self.sample_width) 
@@ -244,7 +254,9 @@ class Radio:
 		#self.radio_processor3 = RadioSamplesProcessor(self.blocksize, self.Fs, self.sample_width, self.f_offset, self.audioFs, 3)
 
 		# Define audio processor
-		self.audio_processor = AudioSamplesProcessor(self.sample_width, self.audioFs)
+		self.audio_processor = AudioSamplesProcessor(self.sample_width, self.audioFs, self.audio_buffer_length)
+
+		self.all_threads = [self.radio_processor1, self.radio_processor2, self.audio_processor]
            
 	def get_radio_samples(self):
 		''' For sampling of a single block in synchronous mode
@@ -277,17 +289,24 @@ class Radio:
 		output_string = self.process_to_audio(samples)
 		self.play_to_speaker(output_string)
 
+	def stop(self):
+		# Stop all consumer threads
+		for i in range(len(self.all_threads)-1):
+			queue.put(None)
+		audio_queue.put(None)
+		for thread in self.all_threads:
+			thread.join()
+
 	def play(self):
 		''' 
-		Start the `sdr` thread that samples the air and the `processor` thread that
-		processes the samples to audio.
+		Start the `sdr` thread that samples the air, the `radio_processor` thread that
+		processes the samples to audio and the `radio_processor` that plays samples.
 		'''
-		
-		self.radio_processor1.start()
-		self.radio_processor2.start()
-		#self.radio_processor3.start()
-		self.audio_processor.start()
-		self.sdr1.run()
+		for thread in self.all_threads:
+			thread.start()
+
+		self.sdr1.run(self.n_blocks)
+		self.stop()
 
 
 	def close(self):
@@ -312,4 +331,3 @@ sortby = 'cumulative'
 ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
 ps.print_stats()
 print(s.getvalue())
-'''
