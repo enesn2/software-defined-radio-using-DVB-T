@@ -78,22 +78,158 @@ class AudioSamplesProcessor(Thread):
 		             input = False,
 		             output = True,
 		             frames_per_buffer = self.audio_buffer_length)	
+		self.previous_block = []
+
 	def run(self):
 		global audio_queue
 		while True:
-			#print('Reading samples:')
 			audio_samples = audio_queue.get()
 			audio_queue.task_done()
+
+			# Used to stop the thread
 			if audio_samples is None:
 				break
+
+			# Fill the previous block with zeros on the first run
+			if not(len(self.previous_block)):
+				self.previous_block = np.zeros((len(audio_samples),),)
+
+			audio_samples = self.audio_filter(audio_samples, self.previous_block, 'robot')
+			# Write to bytes
 			output_string = struct.pack('h' * len(audio_samples), *audio_samples)
 
-			#print('Playing samples length:', len(audio_samples))
-
+			# Write stream
 			self.stream.write(output_string)
+
+			# Keep the previous block
+			self.previous_block = audio_samples
 			
 			#print('Task done')
+		self.stream.stop_stream()
+
+	def audio_filter(self,audio_block, previous_block, type = 'nofilter'):
+		if type == 'robot':
+			audio_block = self.robot(audio_block, previous_block)
+		audio_block = np.clip(audio_block, (-2**(self.sample_width*8-1)), (2**(self.sample_width*8-1) - 1))
+		audio_block = audio_block.astype(int)
+		return audio_block
 		
+
+
+	def stft(self, previous_block, current_block, Nfft, R):
+		'''
+		Short-time Fourier transform performed on two consecutive audio-blocks
+		This function does sfft to the current block, the second half of the previous block + the first
+		half of the current block and the current block This is because we have chosen a
+		a 50% overlap between the blocks in sfft.
+		'''
+
+		# Convert the inputs into numpy arrays
+		overlapping_block = np.concatenate((previous_block[R/2:R], current_block[0:R/2]))
+
+		# Create the window
+		n = np.array(range(1,R+1))+0.5
+		window = np.cos(np.pi*n/R-np.pi/2)
+
+		# Do windowed fft on the previous block
+		X1 = previous_block*window
+		X1 = np.fft.fft(X1,Nfft)
+
+		# Do windowed fft on the overlapping block
+		X2 = overlapping_block*window
+		assert len(X2) == R
+		X2 = np.fft.fft(X2,Nfft)
+
+		# Do windowed fft on the current block
+		X3 = current_block*window
+		X3 = np.fft.fft(X3,Nfft)
+		return X1, X2, X3
+
+	def istft(self, first_block, second_block, third_block, R):
+		''' Inverse short-time Fourier transform on the three blocks returned by sfft()
+		'''
+
+		# Create the window
+		n = np.array(range(1,R+1))+0.5
+		window = np.cos(np.pi*n/R-np.pi/2)
+
+
+		# Find the issft
+		Y1 = np.fft.ifft(first_block, R)
+		Y2 = np.fft.ifft(second_block, R)
+		Y3 = np.fft.ifft(third_block, R)
+		y1 = Y1*window
+		y2 = Y2*window
+		y3 = Y3*window
+		return np.real(y1), np.real(y2), np.real(y3)
+
+	def robot(self, current_audio_block, previous_block):
+
+		# Number of bins in sfft
+		Nfft = 512
+		R = int(Nfft)
+
+		# We only need a sample of the previous block
+		previous_block = previous_block[-1-R+1:]
+
+		# For the filter to work we need to separate the current_block into a number of 
+		# smaller blocks
+		n_blocks = int(len(current_audio_block)/R) + 2
+
+		# Pad the end with zeros which will be removed, if necessary 
+		extra_samples = R - len(current_audio_block)%R
+
+		# We also add `R` more samples because it is necessary for the robot transformation to work
+		current_audio_block = np.concatenate((current_audio_block, np.zeros((extra_samples+R,))))
+
+		processed_block = np.array([])
+		
+		for i in range(n_blocks):
+			current_block = current_audio_block[i*R:i*R+R]
+
+
+			# Since we are doing a 50% sfft, two consecutive blocks,
+			# are needed to do the robot processing
+			# We pass the old input block and the new input block
+			# to the sfft
+			first_block_ft, second_block_ft, third_block_ft = self.stft(previous_block, current_block, Nfft, R)
+
+			# Set phase to zero in STFT-domain
+			first_block_ft = np.absolute(first_block_ft)
+			second_block_ft = np.absolute(second_block_ft)
+			third_block_ft = np.absolute(third_block_ft)
+
+			# Synthesize the new signal
+			first_block, second_block, third_block = self.istft(first_block_ft, second_block_ft, third_block_ft, R)
+
+			# Take the second half of the first block and pad the rest with zeros
+			first_block = np.concatenate((first_block[R/2:R], np.zeros((R/2),)),)
+
+			# Take the first half of the third block and pad the reset with zeros
+			third_block = np.concatenate((np.zeros((R/2),), third_block[0:R/2] ),)
+
+			# Obtain the output from the overlapping regions of the three blocks
+			robot = np.add(first_block, second_block)
+			robot = np.add(robot, third_block)
+
+			# Scale the amplitude
+			robot *= int(32000 / np.max(np.abs(robot))) 
+
+			# Add to the cummulative processed block
+			processed_block = np.concatenate((processed_block, robot))
+
+			# Update the previous block
+			previous_block = current_block
+
+		# Remove the zeros we added earlier
+		processed_block = processed_block[0:len(processed_block) - R - extra_samples]
+
+		return processed_block
+
+	def close():
+		stream.close()
+		p.terminate()
+	
 
 class RadioSamplesProcessor(Thread):
 	'''
@@ -187,8 +323,7 @@ class RadioSamplesProcessor(Thread):
 		x6 *= int(32000 / np.max(np.abs(x6))) 
 
 		# Clip to avoid overflow
-		x6 = np.clip(x6, (-2**(self.sample_width*8-1)), (2**(self.sample_width*8-1) - 1))
-		x6 = x6.astype(int)
+
 
 		return (x6, zi_deemphasis, block_angle)
 
@@ -238,12 +373,12 @@ class Radio:
 
 		self.sample_width = 2
 		self.audio_buffer_length = 10500*3*2
-		self.n_blocks = 20
+		self.n_blocks = 60
 
 		# Sampling parameters for the rtl-sdr
 		self.Fs = 1140000     			    # Sample rate (different from the audio sample rate)
 		self.blocksize = 128*1024*2*2 		    # Samples to capture per bloc
-		self.audioFs = 44000
+		self.audioFs = 40000
 
 		# Configure software defined radio thread/class
 		self.sdr1 = SDR(self.fc, self.Fs, self.blocksize, self.sample_width) 
@@ -331,3 +466,4 @@ sortby = 'cumulative'
 ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
 ps.print_stats()
 print(s.getvalue())
+'''
