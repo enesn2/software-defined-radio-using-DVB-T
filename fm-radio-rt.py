@@ -20,6 +20,9 @@ queue =  Queue(10)
 # This queue stores audio samples
 audio_queue = Queue(10)
 
+# This queue stores filtered audio samples
+filtered_audio_queue = Queue(10)
+
 # These threading modules are used to manage concurrency
 condition = Condition()
 lock = Lock()
@@ -94,7 +97,7 @@ class AudioSamplesProcessor(Thread):
 			if not(len(self.previous_block)):
 				self.previous_block = np.zeros((len(audio_samples),),)
 
-			audio_samples = self.audio_filter(audio_samples, self.previous_block, 'robot')
+			audio_samples = self.audio_filter(audio_samples, self.previous_block, 'robo')
 			# Write to bytes
 			output_string = struct.pack('h' * len(audio_samples), *audio_samples)
 
@@ -337,6 +340,7 @@ class RadioSamplesProcessor(Thread):
 			samples = queue.get()
 			queue.task_done()
 			if samples is None:
+				audio_queue.put(None)
 				break
 			
 			deemphasis_delay = delays[0]
@@ -391,7 +395,7 @@ class Radio:
 		# Define audio processor
 		self.audio_processor = AudioSamplesProcessor(self.sample_width, self.audioFs, self.audio_buffer_length)
 
-		self.all_threads = [self.radio_processor1, self.radio_processor2, self.audio_processor]
+		self.radio_threads = [self.radio_processor1, self.radio_processor2]
            
 	def get_radio_samples(self):
 		''' For sampling of a single block in synchronous mode
@@ -426,9 +430,8 @@ class Radio:
 
 	def stop(self):
 		# Stop all consumer threads
-		for i in range(len(self.all_threads)-1):
+		for i in range(self.radio_threads):
 			queue.put(None)
-		audio_queue.put(None)
 		for thread in self.all_threads:
 			thread.join()
 
@@ -437,8 +440,10 @@ class Radio:
 		Start the `sdr` thread that samples the air, the `radio_processor` thread that
 		processes the samples to audio and the `radio_processor` that plays samples.
 		'''
-		for thread in self.all_threads:
+		for thread in self.radio_threads:
 			thread.start()
+
+		self.audio_processor.start()
 
 		self.sdr1.run(self.n_blocks)
 		self.stop()
