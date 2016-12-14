@@ -229,7 +229,7 @@ class FilterSamplesProcessor(Thread):
 			R = 512
 		elif effect == 'whisper':
 			Nfft = 512
-			R = 256
+			R = 300
 
 		# We only need a sample of the previous block
 		previous_block = previous_block[-1-R+1:]
@@ -436,7 +436,7 @@ class Radio:
 	'''
 	def __init__(self, audio_fs, station = int(100.3e6) ):
 		# The station parameters
-		self.f_station = int(100.3e6)   			# The radio station frequency
+		self.f_station = int(station)   			# The radio station frequency
 		self.f_offset = 250000						# Offset to capture at         
 		self.fc = self.f_station - self.f_offset 	# Capture center frequency  
 
