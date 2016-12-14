@@ -6,7 +6,6 @@ import pyaudio
 import struct
 import time
 import asyncio
-import cProfile, pstats, io
 import threading
 from threading import Thread, Lock, Condition
 from queue import Queue
@@ -14,15 +13,19 @@ import argparse
 
 parser = argparse.ArgumentParser(description='Software-defined radio with audio filters.')
 parser.add_argument('--time', type=int, default=15,
-                    help='Number of seconds to run.')
-parser.add_argument('--audio-filter', type=str, default='none',
-                    help='The audio filter to be applied on sound.')
+                    help='Number of seconds to run. Defaults to 15 seconds.')
+parser.add_argument('--audio-effect', type=str, default='none',
+                    help='The audio filter to be applied on sound. Defaults to none.')
+parser.add_argument('--audio-fs', type=int, default=24000,
+                    help='The audio sampling frequency. Defaults to 24000.')
+parser.add_argument('--station', type=float, default=100.3,
+                    help='The radio station frequency in MHz. Defaults to 100.3 MHz.')
 
 args = parser.parse_args()
 seconds = args.time
-audio_filter = args.audio_filter
-
-pr = cProfile.Profile()
+audio_effect = args.audio_effect
+audio_fs = args.audio_fs
+station_frequency = args.station*1e6
 
 # This global queue stores unprocessed blocks of radio samples
 queue =  Queue(10)
@@ -44,7 +47,6 @@ lock = Lock()
 delays = []
 block_angle = 0
 
-#pr.enable()
 
 class SDR:
 	'''
@@ -120,13 +122,12 @@ class AudioSamplesProcessor(Thread):
 		p.terminate()
 	
 class FilterSamplesProcessor(Thread):
-	''' This thread plays the audio samples from the audio queue
+	''' This filters the audio samples from the main queue.
 	'''
 
-	def __init__(self, R, sample_width, ID, filter = 'none'):
+	def __init__(self, sample_width, ID, filter = 'none'):
 		super(FilterSamplesProcessor, self).__init__()
 		self.filter = filter
-		self.R = R
 		self.ID = ID
 		self.sample_width = sample_width
 		self.previous_block = []
@@ -153,7 +154,7 @@ class FilterSamplesProcessor(Thread):
 			if not(self.previous_block is None) and not(len(self.previous_block)):
 				self.previous_block = np.zeros((len(audio_samples),),)
 
-			audio_samples = self.audio_filter(audio_samples, self.previous_block, self.filter)
+			audio_samples = self.audio_effect(audio_samples, self.previous_block, self.filter)
 
 			filtered_audio_queue.put(audio_samples)
 
@@ -162,9 +163,11 @@ class FilterSamplesProcessor(Thread):
 			
 
 
-	def audio_filter(self,audio_block, previous_block, type = 'none'):
+	def audio_effect(self,audio_block, previous_block, type = 'none'):
 		if type == 'robot':
-			audio_block = self.robot(audio_block, previous_block)
+			audio_block = self.phase_vocoder(audio_block, previous_block)
+		elif type == 'whisper':
+			audio_block = self.phase_vocoder(audio_block, previous_block, 'whisper')
 		audio_block = np.clip(audio_block, (-2**(self.sample_width*8-1)), (2**(self.sample_width*8-1) - 1))
 		audio_block = audio_block.astype(int)
 		return audio_block
@@ -209,7 +212,6 @@ class FilterSamplesProcessor(Thread):
 		n = np.array(range(1,R+1))+0.5
 		window = np.cos(np.pi*n/R-np.pi/2)
 
-
 		# Find the issft
 		Y1 = np.fft.ifft(first_block, R)
 		Y2 = np.fft.ifft(second_block, R)
@@ -219,11 +221,15 @@ class FilterSamplesProcessor(Thread):
 		y3 = Y3*window
 		return np.real(y1), np.real(y2), np.real(y3)
 
-	def robot(self, current_audio_block, previous_block):
+	def phase_vocoder(self, current_audio_block, previous_block, effect = 'robot'):
 
-		# Number of bins in sfft
-		Nfft = self.R
-		R = int(Nfft)
+		# Number of bins in sfft. This block size works well for the 'robot' effect
+		if effect == 'robot':
+			Nfft = 512
+			R = 512
+		elif effect == 'whisper':
+			Nfft = 512
+			R = 256
 
 		# We only need a sample of the previous block
 		previous_block = previous_block[-1-R+1:]
@@ -250,10 +256,20 @@ class FilterSamplesProcessor(Thread):
 			# to the sfft
 			first_block_ft, second_block_ft, third_block_ft = self.stft(previous_block, current_block, Nfft, R)
 
-			# Set phase to zero in STFT-domain
-			first_block_ft = np.absolute(first_block_ft)
-			second_block_ft = np.absolute(second_block_ft)
-			third_block_ft = np.absolute(third_block_ft)
+			
+			if effect == 'robot':
+				# Set phase to zero in STFT-domain
+				first_block_ft = np.absolute(first_block_ft)
+				second_block_ft = np.absolute(second_block_ft)
+				third_block_ft = np.absolute(third_block_ft)
+			elif effect == 'whisper':
+				# Set the phase to a random number
+				angle = np.random.rand(3*Nfft)
+				angle = angle * 2 * np.pi
+				angle = np.cos(angle) + np.sin(angle)*1j
+				first_block_ft = np.absolute(first_block_ft)*angle[0:Nfft]
+				second_block_ft = np.absolute(second_block_ft)*angle[Nfft:2*Nfft]
+				third_block_ft = np.absolute(third_block_ft)*angle[2*Nfft:3*Nfft]
 
 			# Synthesize the new signal
 			first_block, second_block, third_block = self.istft(first_block_ft, second_block_ft, third_block_ft, R)
@@ -418,7 +434,7 @@ class RadioSamplesProcessor(Thread):
 class Radio:
 	''' This is the main class of the program
 	'''
-	def __init__(self, station = int(100.3e6) ):
+	def __init__(self, audio_fs, station = int(100.3e6) ):
 		# The station parameters
 		self.f_station = int(100.3e6)   			# The radio station frequency
 		self.f_offset = 250000						# Offset to capture at         
@@ -494,7 +510,7 @@ class Radio:
 		self.n_filter_threads = 2
 		self.filter_threads = []
 		for i in range(self.n_filter_threads):
-			self.filter_threads.append(FilterSamplesProcessor(512, self.sample_width, i, filter_type))
+			self.filter_threads.append(FilterSamplesProcessor(self.sample_width, i, filter_type))
 
 		# Define audio processor
 		self.audio_processor = AudioSamplesProcessor(self.sample_width, self.audioFs, self.audio_buffer_length)
@@ -519,15 +535,5 @@ class Radio:
 		self.p.terminate()
 
 
-radio = Radio()
-radio.play(audio_filter, seconds)
-#radio.close()
-
-'''
-pr.disable()
-s = io.StringIO()
-sortby = 'cumulative'
-ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-ps.print_stats()
-print(s.getvalue())
-'''
+radio = Radio(audio_fs, station_frequency)
+radio.play(audio_effect, seconds)
