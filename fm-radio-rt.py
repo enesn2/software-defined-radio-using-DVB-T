@@ -12,11 +12,11 @@ from queue import Queue
 import argparse
 
 parser = argparse.ArgumentParser(description='Software-defined radio with audio filters.')
-parser.add_argument('--time', type=int, default=15,
+parser.add_argument('--time', type=int, default=np.inf,
                     help='Number of seconds to run. Defaults to 15 seconds.')
 parser.add_argument('--audio-effect', type=str, default='none',
                     help='The audio filter to be applied on sound. Defaults to none.')
-parser.add_argument('--audio-fs', type=int, default=24000,
+parser.add_argument('--audio-fs', type=int, default=44000,
                     help='The audio sampling frequency. Defaults to 24000.')
 parser.add_argument('--station', type=float, default=100.3,
                     help='The radio station frequency in MHz. Defaults to 100.3 MHz.')
@@ -36,7 +36,7 @@ audio_queue = Queue(10)
 # This global queue stores filtered audio samples
 filtered_audio_queue = Queue(10)
 
-# This global variable will contain the last block that was filtered
+# This global variable will contain the last block that was filtered, used for some audio effects
 last_filtered = []
 
 # These threading modules are used to manage concurrency
@@ -55,8 +55,6 @@ class SDR:
 	'''
 
 	def __init__(self, startFc, Fs, blocksize, sample_width):
-		#super(SDR, self).__init__()
-
 		self.blocksize = blocksize
 		self.sample_width = sample_width
 		self.sdr = RtlSdrAio()
@@ -73,7 +71,6 @@ class SDR:
 		global queue
 		blocks_so_far = 0
 		async for samples in self.sdr.stream(num_samples_or_bytes = 2*self.blocksize, format = 'bytes'):
-			#print('Gathered a block')
 			queue.put(samples)
 			blocks_so_far+=1
 			if blocks_so_far>=n_blocks:
@@ -88,6 +85,7 @@ class AudioSamplesProcessor(Thread):
 		super(AudioSamplesProcessor, self).__init__()
 
 		self.sample_width = sample_width
+		# Instantiate a PyAudio object that streams audio to the output device
 		self.p = pyaudio.PyAudio()
 		self.audio_buffer_length = audio_buffer_length
 		self.stream = self.p.open(format = self.p.get_format_from_width(self.sample_width),
@@ -99,6 +97,7 @@ class AudioSamplesProcessor(Thread):
 
 
 	def run(self):
+		'''This is the main process of the thread'''
 		global filtered_audio_queue
 		while True:
 			audio_samples = filtered_audio_queue.get()
@@ -121,12 +120,12 @@ class AudioSamplesProcessor(Thread):
 		stream.close()
 		p.terminate()
 	
-class FilterSamplesProcessor(Thread):
-	''' This filters the audio samples from the main queue.
+class EffectsProcessor(Thread):
+	''' This thread adds audio effects to the samples in `audio_queue`.
 	'''
 
 	def __init__(self, sample_width, ID, filter = 'none'):
-		super(FilterSamplesProcessor, self).__init__()
+		super(EffectsProcessor, self).__init__()
 		self.filter = filter
 		self.ID = ID
 		self.sample_width = sample_width
@@ -154,6 +153,7 @@ class FilterSamplesProcessor(Thread):
 			if not(self.previous_block is None) and not(len(self.previous_block)):
 				self.previous_block = np.zeros((len(audio_samples),),)
 
+			# Add the wanted audio effect
 			audio_samples = self.audio_effect(audio_samples, self.previous_block, self.filter)
 
 			filtered_audio_queue.put(audio_samples)
@@ -164,6 +164,7 @@ class FilterSamplesProcessor(Thread):
 
 
 	def audio_effect(self,audio_block, previous_block, type = 'none'):
+		'''Current phase vocoder effects "robot and "whisper" are implemented.'''
 		if type == 'robot':
 			audio_block = self.phase_vocoder(audio_block, previous_block)
 		elif type == 'whisper':
@@ -179,7 +180,7 @@ class FilterSamplesProcessor(Thread):
 		Short-time Fourier transform performed on two consecutive audio-blocks
 		This function does sfft to the current block, the second half of the previous block + the first
 		half of the current block and the current block This is because we have chosen a
-		a 50% overlap between the blocks in sfft.
+		a 50% overlap between the blocks in sfft. It is used for the effects in `phase_vocoder`
 		'''
 
 		# Convert the inputs into numpy arrays
@@ -205,7 +206,7 @@ class FilterSamplesProcessor(Thread):
 		return X1, X2, X3
 
 	def istft(self, first_block, second_block, third_block, R):
-		''' Inverse short-time Fourier transform on the three blocks returned by sfft()
+		''' Inverse short-time Fourier transform on the three blocks returned by `sfft()`
 		'''
 
 		# Create the window
@@ -302,8 +303,8 @@ class FilterSamplesProcessor(Thread):
 
 class RadioSamplesProcessor(Thread):
 	'''
-	A consumer thread. This thread processes the radio samples into audio and passes
-	them to the PyAudio object to be played by the audio output device.
+	A consumer thread. This thread processes the radio samples into audio samples and passes
+	them to the `àudio_queue`.
 	'''
 
 	def __init__(self, blocksize, Fs, sample_width, f_offset, audioFs, ID):
@@ -412,24 +413,9 @@ class RadioSamplesProcessor(Thread):
 			now = time.time()
 			audio_samples, deemphasis_delay, block_angle_current = self.process_to_audio(
 				samples, deemphasis_delay, block_angle)
-			#delays[0] = deemphasis_delay
-			#block_angle = block_angle_current
-			#lock.acquire()
 			
 			audio_queue.put(audio_samples)
 			queue.task_done()
-			#print('')
-			#print('Thread',  threading.current_thread(), 'done')
-			#lock.release()
-			#print('Placed audio samples' )	
-			
-			
-			#print('It took',time.time()-now,'seconds to process the audio samples.')
-			#print('Samples are', float(len(audio_samples))/48000.00,'secondslong.')
-			#print(len(audio_samples))
-			  
-
-
 
 class Radio:
 	''' This is the main class of the program
@@ -447,7 +433,7 @@ class Radio:
 		# Sampling parameters for the rtl-sdr
 		self.Fs = 1140000     			    # Sample rate (different from the audio sample rate)
 		self.blocksize = 128*1024*2*2 		    # Samples to capture per bloc
-		self.audioFs = 24000
+		self.audioFs = audio_fs
 
 		# Configure software defined radio thread/class
 		self.sdr1 = SDR(self.fc, self.Fs, self.blocksize, self.sample_width) 
@@ -510,7 +496,7 @@ class Radio:
 		self.n_filter_threads = 2
 		self.filter_threads = []
 		for i in range(self.n_filter_threads):
-			self.filter_threads.append(FilterSamplesProcessor(self.sample_width, i, filter_type))
+			self.filter_threads.append(EffectsProcessor(self.sample_width, i, filter_type))
 
 		# Define audio processor
 		self.audio_processor = AudioSamplesProcessor(self.sample_width, self.audioFs, self.audio_buffer_length)
