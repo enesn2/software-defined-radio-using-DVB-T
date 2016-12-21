@@ -1,12 +1,10 @@
 #!/bin/bash
 
-apt-get update  # update list of available software  
-apt-get -y install git cmake libusb-1.0-0-dev python python-pip python-dev
-apt-get -y install python-scipy python-numpy python-matplotlib
+sudo apt-get update  # update list of available software  
+sudo apt-get -y install git cmake libusb-1.0-0-dev python3 python3-pip python3-dev
+sudo apt-get -y install python3-scipy python3-numpy
 
-
-# Remove other RTL-SDR driver, if it is loaded
-modprobe -r dvb_usb_rtl28xxu
+cd
 
 git clone https://github.com/steve-m/librtlsdr  
 cd librtlsdr  
@@ -14,14 +12,15 @@ mkdir build
 cd build  
 cmake ../  
 make  
-make install  
+sudo make install  
 ldconfig  
 
 cd
 
-pip install pyrtlsdr  
-pip install pyaudio  
+git clone https://github.com/roger-/pyrtlsdr.git
+cd pyrtlsdr
+sudo python3 setup.py install
 
-wget https://raw.githubusercontent.com/keenerd/rtl-sdr-misc/master/heatmap/flatten.py
+sudo pip3 install pyaudio  
 
 
