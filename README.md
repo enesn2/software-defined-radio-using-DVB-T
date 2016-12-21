@@ -1,17 +1,30 @@
-# Software defined radio
-To setup the necessary packages on your computer run
+# Description
+
+# Dependencies
++ Windows/Linux/OSX
++ Python 3.3+
++ pyrtlsdr
++ SciPy
++ NumPy
++ PyAudio
+
+The code has only been tested on Linux so far, but in theory it should work across all operating systems if the dependencies are present. The `setup.sh` script only works with Linux.
+
+# Usage
+Download the source files and install the necessary libraries folder by running: 
 ```
-bash fm-radio-setup.sh  
+sudo bash setup.py
 ```
-To capture a recording run
+in the source folder. To play the broadcast of an FM radio station run:
 ```
-python fm-radio.py
+python3 fm-radio-rt.py --station=<frequency in MHz>
 ```
-This will produce the file wbfm-mono.raw containing the audio. To run the file use
+This will play the broadcast for two minutes. To change the play time add the argument `--time=<number of seconds>`.
+
+Applying the 'robot' audio effect to a broadcast:
 ```
-aplay wbfm-mono.raw -r 45600 -f S16_LE -t raw -c 1  
+python3 fm-radio-rt.py --station=<frequency in MHz> --audio-effect=robot
 ```
-You might need to install the sox library first using 
-```
-sudo apt-get install sox
-```
+To apply the 'whisper' audio effect to a broadcast add `--audio-effect=whisper` instead.
+
+If the audio stutter occurs while running, try decreasing the audio sampling rate to a lower one such as 24000 by adding `--audio-fs=24000`. Note that in the current version of the code other sampling rates may cause distortions in the audio.
