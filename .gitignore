@@ -1,3 +1,5 @@
 coroutine-example.py
-wbfm-mono.raw
+*.raw
 plots/
+*.swp
+*.log
