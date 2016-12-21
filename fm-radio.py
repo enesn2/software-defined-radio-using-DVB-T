@@ -1,9 +1,11 @@
 from rtlsdr import RtlSdr  
 import numpy as np  
 import scipy.signal as signal
-import pyaudio
 import time
 
+'''
+This script samples and processes only one block of samples. The output is a raw file containing the audio.
+'''
 
 # The radio station frequency
 F_station = int(100.3e6)   	# Rutgers Radio  
