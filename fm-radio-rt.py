@@ -12,7 +12,7 @@ from queue import Queue
 import argparse
 
 parser = argparse.ArgumentParser(description='Software-defined radio with audio filters.')
-parser.add_argument('--time', type=int, default=np.inf,
+parser.add_argument('--time', type=int, default=120,
                     help='Number of seconds to run. Defaults to 15 seconds.')
 parser.add_argument('--audio-effect', type=str, default='none',
                     help='The audio filter to be applied on sound. Defaults to none.')
