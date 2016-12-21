@@ -1,5 +1,5 @@
 # Description
-This code utilizes USB DVB-T dongles based on the Realtek RTL2832U chipset to stream FM radio broadcasts in real time. In addition, the code has the capability to add audio effects to the original audio. Currently, two audio effects are implemented, "robotization" and "whisperization". 
+This code utilizes USB DVB-T dongles based on the Realtek RTL2832U chipset to stream FM radio broadcasts in real time. In addition, the code has the capability to add audio effects to the original audio. Currently, two audio effects are implemented, "robotization" and "whisperization". The program was written for Python 3 and it can't be ran in Python 2.
 
 # Usage
 Download the source files and install the necessary libraries by running: 
